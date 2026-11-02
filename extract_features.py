@@ -12,6 +12,8 @@ import urllib.request
 from json_repair import repair_json
 from pathlib import Path
 
+from travel_schema import to_travel_document
+
 
 DEFAULT_HOST = "http://127.0.0.1:11435"
 DEFAULT_MODEL = "qwen:7b"
@@ -25,8 +27,13 @@ Never calculate a new total."""
 
 USER_TEMPLATE = """Extract the useful travel and booking features written in this document.
 booking_references means a booking reference, PNR, or record locator.
+confirmation_codes means a confirmation or voucher number, not a flight or train number.
+ticket_numbers means a ticket number, not a seat and not a booking reference.
 service_number means only the flight, train, or bus number.
-Create one transport item per flight, train, or bus. Do not put a hotel in transport.
+Create one transport item per flight segment, train, or bus. Do not put a hotel in transport.
+Copy dates and times exactly as printed. Do not add a timezone.
+booking_date is the date the booking was made, not the departure or check-in date.
+issue_date is the date the ticket was issued, not the travel date.
 notes are short conditions copied from the document, such as a cancellation deadline.
 
 Document:
@@ -71,7 +78,11 @@ TERMINAL_RE = re.compile(r"\bTerminal\s+[A-Z0-9]+\b", re.I)
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "document_type": {"type": "string", "enum": sorted(DOCUMENT_TYPES)},
+        "document_type": {"type": "string", "enum": sorted(DOCUMENT_TYPES | {"boarding_pass", "unknown"})},
+        "document_title": {"type": "string"},
+        "booking_status": {"type": "string"},
+        "booking_date": {"type": "string"},
+        "issue_date": {"type": "string"},
         "booking_references": {"type": "array", "items": {"type": "string"}},
         "confirmation_codes": {"type": "array", "items": {"type": "string"}},
         "ticket_numbers": {"type": "array", "items": {"type": "string"}},
@@ -98,6 +109,10 @@ RESPONSE_SCHEMA = {
                     "seat": {"type": "string"},
                     "cabin": {"type": "string"},
                     "fare": {"type": "string"},
+                    "boarding_time": {"type": "string"},
+                    "coach": {"type": "string"},
+                    "platform": {"type": "string"},
+                    "status": {"type": "string"},
                 },
                 "required": [
                     "mode",
@@ -110,6 +125,10 @@ RESPONSE_SCHEMA = {
                     "seat",
                     "cabin",
                     "fare",
+                    "boarding_time",
+                    "coach",
+                    "platform",
+                    "status",
                 ],
             },
         },
@@ -126,6 +145,8 @@ RESPONSE_SCHEMA = {
                     "guests": {"type": "string"},
                     "confirmation_code": {"type": "string"},
                     "total": {"type": "string"},
+                    "nights": {"type": "string"},
+                    "cancellation": {"type": "string"},
                 },
                 "required": [
                     "name",
@@ -136,6 +157,8 @@ RESPONSE_SCHEMA = {
                     "guests",
                     "confirmation_code",
                     "total",
+                    "nights",
+                    "cancellation",
                 ],
             },
         },
@@ -173,6 +196,10 @@ RESPONSE_SCHEMA = {
     },
     "required": [
         "document_type",
+        "document_title",
+        "booking_status",
+        "booking_date",
+        "issue_date",
         "booking_references",
         "confirmation_codes",
         "ticket_numbers",
@@ -418,9 +445,10 @@ def to_features(raw: dict) -> dict:
         travelers.append(
             {
                 "name": _as_text(item.get("name")),
-                "role": None,
-                "ticket_number": None,
+                "role": _as_text(item.get("role")),
+                "ticket_number": _as_text(item.get("ticket_number")),
                 "seat": _as_text(item.get("seat")),
+                "coach": _as_text(item.get("coach")),
             }
         )
 
@@ -442,8 +470,11 @@ def to_features(raw: dict) -> dict:
                 "to": destination,
                 "seat": _as_text(item.get("seat")),
                 "cabin_or_class": _as_text(item.get("cabin")),
-                "status": None,
+                "status": _as_text(item.get("status")),
                 "fare": _as_text(item.get("fare")),
+                "boarding_time": _as_text(item.get("boarding_time")),
+                "coach": _as_text(item.get("coach")),
+                "platform": _as_text(item.get("platform")),
             }
         )
 
@@ -462,6 +493,8 @@ def to_features(raw: dict) -> dict:
                 "guests": _as_text(item.get("guests")),
                 "confirmation_code": _as_text(item.get("confirmation_code")),
                 "total": _as_text(item.get("total")),
+                "nights": _as_text(item.get("nights")),
+                "cancellation": _as_text(item.get("cancellation")),
             }
         )
 
@@ -485,7 +518,11 @@ def to_features(raw: dict) -> dict:
     features = empty_features()
     features.update(
         {
-            "document_type": document_type if document_type in DOCUMENT_TYPES else "other",
+            "document_type": document_type if document_type in DOCUMENT_TYPES | {"boarding_pass", "unknown"} else "other",
+            "document_title": _as_text(raw.get("document_title")),
+            "booking_status": _as_text(raw.get("booking_status")),
+            "booking_date": _as_text(raw.get("booking_date")),
+            "issue_date": _as_text(raw.get("issue_date")),
             "booking_references": _strings(raw.get("booking_references")),
             "confirmation_codes": _strings(raw.get("confirmation_codes")),
             "ticket_numbers": _strings(raw.get("ticket_numbers")),
@@ -646,10 +683,17 @@ def _finish(features: dict, source_text: str) -> dict:
     return _merge(empty_features(), _prune(grounded))
 
 
-def extract_features(text: str, *, host: str, model: str, timeout: float) -> dict:
+def extract_features(
+    text: str,
+    *,
+    host: str,
+    model: str,
+    timeout: float,
+    source_name: str | None = None,
+) -> dict:
     parts = split_text(text)
     if not parts:
-        return empty_features()
+        return to_travel_document({}, source_filename=source_name).model_dump(mode="json")
 
     features = empty_features()
     total = len(parts)
@@ -671,7 +715,8 @@ def extract_features(text: str, *, host: str, model: str, timeout: float) -> dic
         if parsed is None:
             raise RuntimeError(str(last_error))
         features = _merge(features, parsed)
-    return _finish(features, text)
+    finished = _finish(features, text)
+    return to_travel_document(finished, source_text=text, source_filename=source_name).model_dump(mode="json")
 
 
 def collect_texts(inputs: list[Path]) -> list[Path]:
@@ -724,13 +769,13 @@ def summarize(features: dict) -> str:
     document_type = features.get("document_type") or "unknown"
     travelers = [
         item.get("name")
-        for item in features.get("travelers") or []
+        for item in features.get("passengers") or []
         if isinstance(item, dict) and item.get("name")
     ]
     references = features.get("booking_references") or []
     bits = [str(document_type)]
     if travelers:
-        bits.append("travelers: " + ", ".join(str(name) for name in travelers))
+        bits.append("passengers: " + ", ".join(str(name) for name in travelers))
     if references:
         bits.append("refs: " + ", ".join(str(ref) for ref in references))
     return "; ".join(bits)
@@ -827,6 +872,7 @@ def main(argv: list[str] | None = None) -> int:
                 host=args.host,
                 model=args.model,
                 timeout=args.timeout,
+                source_name=source.name,
             )
         except (RuntimeError, json.JSONDecodeError, OSError) as exc:
             failures += 1
