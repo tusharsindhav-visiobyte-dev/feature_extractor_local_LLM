@@ -9,6 +9,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
+from json_repair import repair_json
 from pathlib import Path
 
 
@@ -292,18 +293,30 @@ def split_text(text: str, size: int = CHUNK_CHARACTERS) -> list[str]:
     return chunks
 
 
+def _json_text(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start : end + 1]
+    return text
+
+
 def parse_json_object(raw: str) -> dict:
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    text = _json_text(raw)
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
-            raise RuntimeError("qwen:7b did not return JSON.")
-        parsed = json.loads(raw[start : end + 1])
+        parsed = json.loads(text)
+    except json.JSONDecodeError as first_error:
+        # qwen sometimes omits commas or quotes inside an otherwise valid object.
+        repaired = repair_json(text, return_objects=True)
+        if not isinstance(repaired, dict):
+            raise RuntimeError(
+                f"qwen:7b did not return usable JSON: {first_error.msg} "
+                f"(line {first_error.lineno}, column {first_error.colno})"
+            ) from first_error
+        parsed = repaired
     if not isinstance(parsed, dict):
         raise RuntimeError("qwen:7b returned JSON that is not an object.")
     return parsed
@@ -643,8 +656,21 @@ def extract_features(text: str, *, host: str, model: str, timeout: float) -> dic
     for index, part in enumerate(parts, start=1):
         if total > 1:
             print(f"Part {index}/{total}", file=sys.stderr)
-        raw = ollama_generate(host, model, USER_TEMPLATE.format(text=part), timeout)
-        features = _merge(features, to_features(parse_json_object(raw)))
+        prompt = USER_TEMPLATE.format(text=part)
+        parsed = None
+        last_error: Exception | None = None
+        for attempt in range(2):
+            raw = ollama_generate(host, model, prompt, timeout)
+            try:
+                parsed = to_features(parse_json_object(raw))
+                break
+            except (RuntimeError, json.JSONDecodeError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    print("Model JSON was invalid, retrying", file=sys.stderr)
+        if parsed is None:
+            raise RuntimeError(str(last_error))
+        features = _merge(features, parsed)
     return _finish(features, text)
 
 
@@ -667,9 +693,25 @@ def collect_texts(inputs: list[Path]) -> list[Path]:
     return files
 
 
+def features_path(source: Path, output_dir: Path | None) -> Path:
+    directory = output_dir if output_dir is not None else source.parent
+    return directory / f"{source.stem}.features.json"
+
+
+def already_extracted(path: Path) -> bool:
+    """True when the feature file exists and contains a JSON object."""
+    if not path.is_file():
+        return False
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, dict)
+
+
 def output_path(source: Path, output_dir: Path | None, used: set[Path]) -> Path:
     directory = output_dir if output_dir is not None else source.parent
-    candidate = directory / f"{source.stem}.features.json"
+    candidate = features_path(source, output_dir)
     suffix = 2
     while candidate in used:
         candidate = directory / f"{source.stem}_{suffix}.features.json"
@@ -764,8 +806,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.output is not None and not output_is_file:
         args.output.mkdir(parents=True, exist_ok=True)
 
-    used: set[Path] = set()
+    pending: list[Path] = []
     for source in files:
+        destination = args.output if output_is_file else features_path(source, args.output)
+        if already_extracted(destination):
+            print(f"{source.name}: already extracted -> {destination}")
+            continue
+        pending.append(source)
+
+    if not pending:
+        print("All text files already have feature JSON.")
+        return 0
+
+    used: set[Path] = set()
+    for source in pending:
         print(f"{source.name}: asking {args.model}", file=sys.stderr)
         try:
             features = extract_features(

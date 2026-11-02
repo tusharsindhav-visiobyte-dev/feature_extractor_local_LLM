@@ -1,5 +1,8 @@
 .venv/
+.DS_Store
 __pycache__/
 data/
 *.pdf
 *.features.json
+.ipynb_checkpoints/
+.*ipynb
